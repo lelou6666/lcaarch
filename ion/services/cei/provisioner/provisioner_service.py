@@ -1,12 +1,18 @@
 #!/usr/bin/env python
 
 import ion.util.ionlog
+from ion.util.state_object import BasicLifecycleObject
+
 log = ion.util.ionlog.getLogger(__name__)
 
 from twisted.internet import defer #, reactor
 from ion.core.process.service_process import ServiceProcess, ServiceClient
 from ion.core.process.process import ProcessFactory
+<<<<<<< HEAD:ion/services/cei/provisioner/provisioner_service.py
 from ion.services.cei.provisioner.store import ProvisionerStore
+=======
+from ion.services.cei.provisioner.store import ProvisionerStore, CassandraProvisionerStore
+>>>>>>> refs/remotes/nimbusproject/cei:ion/services/cei/provisioner/provisioner_service.py
 from ion.services.cei.provisioner.core import ProvisionerCore
 from ion.services.cei.dtrs import DeployableTypeRegistryClient
 from ion.services.cei import cei_events
@@ -18,20 +24,66 @@ class ProvisionerService(ServiceProcess):
     # Declaration of service
     declare = ServiceProcess.service_declare(name='provisioner', version='0.1.0', dependencies=[])
 
+    @defer.inlineCallbacks
     def slc_init(self):
         cei_events.event("provisioner", "init_begin", log)
-        self.store = ProvisionerStore()
+        store = self.spawn_args.get('store')
+
+        if not store:
+            store = yield self._get_cassandra_store()
+
+        if not store:
+            log.info("Using in-memory Provisioner store")
+            store = ProvisionerStore()
+
+        self.store = store
+
         notifier = self.spawn_args.get('notifier')
         self.notifier = notifier or ProvisionerNotifier(self)
+        
         self.dtrs = DeployableTypeRegistryClient(self)
         self.core = ProvisionerCore(self.store, self.notifier, self.dtrs)
         cei_events.event("provisioner", "init_end", log)
+
+        # operator can disable new launches
+        self.enabled = True
+
+    def slc_terminate(self):
+        if self.store and isinstance(self.store, BasicLifecycleObject):
+            log.debug("Terminating store process")
+            self.store.terminate()
+
+
+    @defer.inlineCallbacks
+    def _get_cassandra_store(self):
+        info = self.spawn_args.get('cassandra_store')
+        if not info:
+            defer.returnValue(None)
+
+        host = info['host']
+        port = int(info['port'])
+        username = info['username']
+        password = info['password']
+        keyspace = info['keyspace']
+        prefix = info.get('prefix')
+
+        log.info('Using Cassandra Provisioner store')
+        store = CassandraProvisionerStore(host, port, username, password,
+                                          prefix=prefix)
+        store.initialize()
+        store.activate()
+        yield store.assure_schema(keyspace)
+        defer.returnValue(store)
 
     @defer.inlineCallbacks
     def op_provision(self, content, headers, msg):
         """Service operation: Provision a taskable resource
         """
         log.debug("op_provision content:"+str(content))
+
+        if not self.enabled:
+            log.error('Provisioner is DISABLED. Ignoring provision request!')
+            defer.returnValue(None)
 
         launch, nodes = yield self.core.prepare_provision(content)
 
@@ -46,13 +98,13 @@ class ProvisionerService(ServiceProcess):
     def op_terminate_nodes(self, content, headers, msg):
         """Service operation: Terminate one or more nodes
         """
-        log.debug('op_terminate_nodess content:'+str(content))
+        log.debug('op_terminate_nodes content:'+str(content))
 
         #expecting one or more node IDs
         if not isinstance(content, list):
             content = [content]
 
-        #TODO yield self.core.mark_nodes_terminating(content)
+        yield self.core.mark_nodes_terminating(content)
 
         #reactor.callLater(0, self.core.terminate_nodes, content)
         yield self.core.terminate_nodes(content)
@@ -82,6 +134,16 @@ class ProvisionerService(ServiceProcess):
         yield self.core.query_nodes(content)
         if msg:
             yield self.reply_ok(msg)
+
+    @defer.inlineCallbacks
+    def op_terminate_all(self, content, headers, msg):
+        """Service operation: terminate all running instances
+        """
+        log.critical('Disabling provisioner, future requests will be ignored')
+        self.enabled = False
+
+        yield self.core.terminate_all()
+
 
 
 class ProvisionerClient(ServiceClient):
@@ -146,6 +208,15 @@ class ProvisionerClient(ServiceClient):
         yield self._check_init()
         log.debug('Sending terminate_nodes request to provisioner')
         yield self.send('terminate_nodes', nodes)
+
+    @defer.inlineCallbacks
+    def terminate_all(self):
+        """Terminate all running nodes and disable provisioner
+        """
+        yield self._check_init()
+        log.critical('Sending terminate_all request to provisioner')
+        yield self.send('terminate_all', None)
+
 
 class ProvisionerNotifier(object):
     """Abstraction for sending node updates to subscribers.
